@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/KiranSatyaRaj/go-backend-server/internal/auth"
 	"github.com/KiranSatyaRaj/go-backend-server/internal/database"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -192,7 +193,8 @@ func main() {
 	})
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
 		type userinfo struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -202,7 +204,13 @@ func main() {
 			fmt.Println(err)
 			return
 		}
-		user, err := apiConfig.db.CreateUser(r.Context(), info.Email)
+		hashed_password, err := auth.HashPassword(info.Password)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		args := database.CreateUserParams{info.Email, hashed_password}
+		user, err := apiConfig.db.CreateUser(r.Context(), args)
 		resp := struct {
 			ID        uuid.UUID `json:"id"`
 			CreatedAt time.Time `json:"created_at"`
@@ -216,6 +224,40 @@ func main() {
 		}
 		w.WriteHeader(201)
 		dat, _ := json.Marshal(resp)
+		w.Write(dat)
+	})
+	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
+		loginInfo := struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}{}
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&loginInfo)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		hash, _ := apiConfig.db.GetPasswordHash(r.Context(), loginInfo.Email)
+		match, err := auth.CheckPasswordHash(loginInfo.Password, hash)
+		if err != nil || !match {
+			w.WriteHeader(401)
+			w.Write([]byte("Incorrect email or password"))
+			return
+		}
+		userinfo, _ := apiConfig.db.GetUserInfo(r.Context(), loginInfo.Email)
+		resp := struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Email     string    `json:"email"`
+		}{
+			ID:        userinfo.ID,
+			CreatedAt: userinfo.CreatedAt,
+			UpdatedAt: userinfo.UpdatedAt,
+			Email:     userinfo.Email,
+		}
+		dat, _ := json.Marshal(resp)
+		w.WriteHeader(200)
 		w.Write(dat)
 	})
 	server := http.Server{Handler: mux}
