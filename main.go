@@ -23,6 +23,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	tokenSecret    string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -69,7 +70,7 @@ func main() {
 	}
 	dbQueries := database.New(db)
 	platform := os.Getenv("PLATFORM")
-	apiConfig := apiConfig{db: dbQueries, platform: platform}
+	apiConfig := apiConfig{db: dbQueries, platform: platform, tokenSecret: os.Getenv("SECRET")}
 	mux := http.NewServeMux()
 	mux.Handle("/app/", apiConfig.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
 	mux.Handle("/app/assets/", apiConfig.middlewareMetricsInc(http.StripPrefix("/app/assets", http.FileServer(http.Dir("./assets/")))))
@@ -84,16 +85,26 @@ func main() {
 	})
 	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, req *http.Request) {
 		type msgbody struct {
-			Body   string    `json:"body"`
-			UserID uuid.UUID `json:"user_id"`
+			Body string `json:"body"`
 		}
 		decoder := json.NewDecoder(req.Body)
+		bearerToken, err := auth.GetBearerToken(req.Header)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		userID, err := auth.ValidateJwt(bearerToken, apiConfig.tokenSecret)
+		if err != nil {
+			fmt.Println(err, "from chirps")
+			w.WriteHeader(401)
+			return
+		}
 		msg := msgbody{}
 		type errmsg struct {
 			Error string `json:"error"`
 		}
 		w.Header().Set("Content-Type", "application/json")
-		err := decoder.Decode(&msg)
+		err = decoder.Decode(&msg)
 		if err != nil {
 			respBody := errmsg{"Something went wrong"}
 			dat, _ := json.Marshal(respBody)
@@ -117,7 +128,7 @@ func main() {
 			}
 		}
 		msg.Body = strings.Join(words, " ")
-		cp := database.CreateChirpParams{msg.Body, msg.UserID}
+		cp := database.CreateChirpParams{msg.Body, userID}
 		userChirp, err := apiConfig.db.CreateChirp(req.Context(), cp)
 		if err != nil {
 			fmt.Println(err)
@@ -245,20 +256,76 @@ func main() {
 			return
 		}
 		userinfo, _ := apiConfig.db.GetUserInfo(r.Context(), loginInfo.Email)
+		access_token, _ := auth.MakeJwt(userinfo.ID, apiConfig.tokenSecret, time.Duration(1)*time.Hour)
+		refresh_token := auth.MakeRefreshToken()
+		refresh_token_args := database.CreateRefreshTokenParams{refresh_token, userinfo.ID}
+		err = apiConfig.db.CreateRefreshToken(r.Context(), refresh_token_args)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
 		resp := struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
+			ID           uuid.UUID `json:"id"`
+			CreatedAt    time.Time `json:"created_at"`
+			UpdatedAt    time.Time `json:"updated_at"`
+			Email        string    `json:"email"`
+			Token        string    `json:"token"`
+			RefreshToken string    `json:"refresh_token"`
 		}{
-			ID:        userinfo.ID,
-			CreatedAt: userinfo.CreatedAt,
-			UpdatedAt: userinfo.UpdatedAt,
-			Email:     userinfo.Email,
+			ID:           userinfo.ID,
+			CreatedAt:    userinfo.CreatedAt,
+			UpdatedAt:    userinfo.UpdatedAt,
+			Email:        userinfo.Email,
+			Token:        access_token,
+			RefreshToken: refresh_token,
 		}
 		dat, _ := json.Marshal(resp)
 		w.WriteHeader(200)
 		w.Write(dat)
+	})
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
+		refresh_token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		user_info, err := apiConfig.db.GetUserFromRefreshToken(r.Context(), refresh_token)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		fmt.Println(time.Now(), user_info.RevokedAt.Time)
+		if time.Now().UTC().After(user_info.ExpiresAt) || (user_info.RevokedAt.Valid) {
+			w.WriteHeader(401)
+			return
+		}
+
+		access_token, err := auth.MakeJwt(user_info.UserID, apiConfig.tokenSecret, time.Duration(1)*time.Hour)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		resp := struct {
+			Token string `json:"token"`
+		}{
+			Token: access_token,
+		}
+		dat, _ := json.Marshal(resp)
+		w.WriteHeader(200)
+		w.Write(dat)
+	})
+	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		refresh_token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		err = apiConfig.db.RevokeRefreshToken(r.Context(), refresh_token)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		w.WriteHeader(204)
 	})
 	server := http.Server{Handler: mux}
 	server.Addr = ":8080"
