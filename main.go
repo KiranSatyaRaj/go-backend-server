@@ -95,7 +95,6 @@ func main() {
 		}
 		userID, err := auth.ValidateJwt(bearerToken, apiConfig.tokenSecret)
 		if err != nil {
-			fmt.Println(err, "from chirps")
 			w.WriteHeader(401)
 			return
 		}
@@ -201,6 +200,38 @@ func main() {
 		dat, _ := json.Marshal(resp)
 		w.WriteHeader(200)
 		w.Write(dat)
+	})
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		chirpID, err := uuid.Parse(r.PathValue("chirpID"))
+		if err != nil {
+			w.WriteHeader(404)
+			return
+		}
+		access_token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		userID, err := auth.ValidateJwt(access_token, apiConfig.tokenSecret)
+		if err != nil {
+			w.WriteHeader(403)
+			return
+		}
+		chirpInfo, err := apiConfig.db.GetChirpByID(r.Context(), chirpID)
+		if err != nil {
+			w.WriteHeader(404)
+			return
+		}
+		if userID != chirpInfo.UserID {
+			w.WriteHeader(403)
+			return
+		}
+		err = apiConfig.db.DeleteChirpByID(r.Context(), chirpID)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		w.WriteHeader(204)
 	})
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
 		type userinfo struct {
@@ -326,6 +357,51 @@ func main() {
 			return
 		}
 		w.WriteHeader(204)
+	})
+	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+		loginInfo := struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}{}
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&loginInfo)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		access_token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		user_id, err := auth.ValidateJwt(access_token, apiConfig.tokenSecret)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		hashedPassword, _ := auth.HashPassword(loginInfo.Password)
+		args := database.UpdateCredsParams{Email: loginInfo.Email, HashedPassword: hashedPassword, ID: user_id}
+		err = apiConfig.db.UpdateCreds(r.Context(), args)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+
+		userInfo, err := apiConfig.db.GetUserInfo(r.Context(), loginInfo.Email)
+		resp := struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Email     string    `json:"email"`
+		}{
+			ID:        userInfo.ID,
+			CreatedAt: userInfo.CreatedAt,
+			UpdatedAt: userInfo.UpdatedAt,
+			Email:     userInfo.Email,
+		}
+		dat, _ := json.Marshal(resp)
+		w.WriteHeader(200)
+		w.Write(dat)
 	})
 	server := http.Server{Handler: mux}
 	server.Addr = ":8080"
