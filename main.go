@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	tokenSecret    string
+	polkaKey       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -70,7 +72,7 @@ func main() {
 	}
 	dbQueries := database.New(db)
 	platform := os.Getenv("PLATFORM")
-	apiConfig := apiConfig{db: dbQueries, platform: platform, tokenSecret: os.Getenv("SECRET")}
+	apiConfig := apiConfig{db: dbQueries, platform: platform, tokenSecret: os.Getenv("SECRET"), polkaKey: os.Getenv("POLKA_KEY")}
 	mux := http.NewServeMux()
 	mux.Handle("/app/", apiConfig.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
 	mux.Handle("/app/assets/", apiConfig.middlewareMetricsInc(http.StripPrefix("/app/assets", http.FileServer(http.Dir("./assets/")))))
@@ -153,6 +155,7 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		authorID := r.URL.Query().Get("author_id")
 		type AllUserChirps struct {
 			Id        uuid.UUID `json:"id"`
 			CreatedAt time.Time `json:"created_at"`
@@ -160,7 +163,19 @@ func main() {
 			Body      string    `json:"body"`
 			UserID    uuid.UUID `json:"user_id"`
 		}
-		userchirps, _ := apiConfig.db.GetAllUserChirps(r.Context())
+		var userchirps []database.Chirp
+		if len(authorID) == 0 {
+			userchirps, _ = apiConfig.db.GetAllUserChirps(r.Context())
+		} else {
+			parsedUID, _ := uuid.Parse(authorID)
+			userchirps, _ = apiConfig.db.GetUserChirps(r.Context(), parsedUID)
+		}
+		sortOpt := r.URL.Query().Get("sort")
+		if len(sortOpt) != 0 {
+			if sortOpt == "desc" {
+				sort.Slice(userchirps, func(i, j int) bool { return userchirps[i].CreatedAt.After(userchirps[j].CreatedAt) })
+			}
+		}
 		resp := make([]AllUserChirps, len(userchirps))
 		for i := 0; i < len(userchirps); i++ {
 			resp[i].Body = userchirps[i].Body
@@ -254,15 +269,17 @@ func main() {
 		args := database.CreateUserParams{info.Email, hashed_password}
 		user, err := apiConfig.db.CreateUser(r.Context(), args)
 		resp := struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
+			ID          uuid.UUID `json:"id"`
+			CreatedAt   time.Time `json:"created_at"`
+			UpdatedAt   time.Time `json:"updated_at"`
+			Email       string    `json:"email"`
+			IsChirpyRed bool      `json:"is_chirpy_red"`
 		}{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+			ID:          user.ID,
+			CreatedAt:   user.CreatedAt,
+			UpdatedAt:   user.UpdatedAt,
+			Email:       user.Email,
+			IsChirpyRed: user.IsChirpyRed,
 		}
 		w.WriteHeader(201)
 		dat, _ := json.Marshal(resp)
@@ -300,6 +317,7 @@ func main() {
 			CreatedAt    time.Time `json:"created_at"`
 			UpdatedAt    time.Time `json:"updated_at"`
 			Email        string    `json:"email"`
+			IsChirpyRed  bool      `json:"is_chirpy_red"`
 			Token        string    `json:"token"`
 			RefreshToken string    `json:"refresh_token"`
 		}{
@@ -307,6 +325,7 @@ func main() {
 			CreatedAt:    userinfo.CreatedAt,
 			UpdatedAt:    userinfo.UpdatedAt,
 			Email:        userinfo.Email,
+			IsChirpyRed:  userinfo.IsChirpyRed,
 			Token:        access_token,
 			RefreshToken: refresh_token,
 		}
@@ -389,19 +408,52 @@ func main() {
 
 		userInfo, err := apiConfig.db.GetUserInfo(r.Context(), loginInfo.Email)
 		resp := struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
+			ID          uuid.UUID `json:"id"`
+			CreatedAt   time.Time `json:"created_at"`
+			UpdatedAt   time.Time `json:"updated_at"`
+			Email       string    `json:"email"`
+			IsChirpyRed bool      `json:"is_chirpy_red"`
 		}{
-			ID:        userInfo.ID,
-			CreatedAt: userInfo.CreatedAt,
-			UpdatedAt: userInfo.UpdatedAt,
-			Email:     userInfo.Email,
+			ID:          userInfo.ID,
+			CreatedAt:   userInfo.CreatedAt,
+			UpdatedAt:   userInfo.UpdatedAt,
+			Email:       userInfo.Email,
+			IsChirpyRed: userInfo.IsChirpyRed,
 		}
 		dat, _ := json.Marshal(resp)
 		w.WriteHeader(200)
 		w.Write(dat)
+	})
+	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		apiKey, err := auth.GetAPIKey(r.Header)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		if apiKey != apiConfig.polkaKey {
+			w.WriteHeader(401)
+			return
+		}
+		body := struct {
+			Event string `json:"event"`
+			Data  struct {
+				UserID string `json:"user_id"`
+			} `json:"data"`
+		}{}
+		decoder := json.NewDecoder(r.Body)
+		err = decoder.Decode(&body)
+
+		if body.Event != "user.upgraded" {
+			w.WriteHeader(204)
+			return
+		}
+		UserID, _ := uuid.Parse(body.Data.UserID)
+		err = apiConfig.db.UpgradeUserToRed(r.Context(), UserID)
+		if err != nil {
+			w.WriteHeader(404)
+			return
+		}
+		w.WriteHeader(204)
 	})
 	server := http.Server{Handler: mux}
 	server.Addr = ":8080"

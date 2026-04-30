@@ -48,6 +48,10 @@ func GetBearerToken(headers http.Header) (string, error) {
 	if len(bearer_token) == 0 {
 		return "", fmt.Errorf("No Auth Token found")
 	}
-	bearer_token = strings.Split(bearer_token, " ")[1]
+	authValue := strings.Split(bearer_token, " ")
+	if len(authValue) < 2 {
+		return "", fmt.Errorf("No Auth Token found")
+	}
+	bearer_token = authValue[1]
 	return bearer_token, nil
 }
